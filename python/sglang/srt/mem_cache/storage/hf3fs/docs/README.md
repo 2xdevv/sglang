@@ -69,3 +69,29 @@ python3 -m sglang.launch_server \
 
 ### Multi-Node Deployment (Shared KV Cache)
 Follow the [deploy_sglang_3fs_multinode.md](deploy_sglang_3fs_multinode.md) guide to deploy SGLang with 3FS across multiple nodes for shared KV caching.
+
+### Zero-Copy Host-Pool I/O (Optional)
+By default each USRBIO read/write is staged through a small per-worker shared-memory
+buffer and `memcpy`'d to/from the HiCache host pool. To let 3FS transfer pages
+directly to/from the host pool, opt in at server start:
+
+```bash
+    --hicache-mem-layout page_first_direct \
+    --hicache-storage-backend hf3fs \
+    --hicache-storage-backend-extra-config '{"hf3fs_zero_copy_host_pool": true}'
+```
+
+- Requires the `page_first` or `page_first_direct` host layout (MHA or MLA KV pools).
+  Other layouts, hybrid side pools (e.g. Mamba), and any tensor outside the registered
+  host pool keep the staging copy.
+- The host pool is allocated in `/dev/shm` (before it is pinned for CUDA), so `/dev/shm`
+  must be able to hold the whole host pool; if it cannot, the pool falls back to
+  anonymous memory and the staging copy, with a warning. In containers, size
+  `/dev/shm` accordingly. Hugepages (`SGLANG_HUGEPAGE_SIZE`) are not used for this pool.
+- The pool is registered with 3FS for RDMA in blocks (default 1 GiB, rounded down to a
+  multiple of the page I/O size). Override with `"iov_block_size"` (bytes) in the
+  HF3FS JSON config if your IB driver needs smaller memory regions.
+- The pool's `/dev/shm` name is removed right after its first registration. Detaching
+  the storage backend leaves the host pool intact, but a later re-attach in the same
+  process uses the staging copy. Attaching at runtime to a server started without the
+  opt-in also uses the staging copy.

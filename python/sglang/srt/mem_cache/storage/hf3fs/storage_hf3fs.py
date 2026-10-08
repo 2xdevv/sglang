@@ -23,7 +23,11 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransferResult,
 )
 from sglang.srt.mem_cache.pool_host import HostKVCache
+from sglang.srt.mem_cache.pool_host.common import HF3FS_ZERO_COPY_CONFIG_KEY
 from sglang.srt.mem_cache.storage.hf3fs.hf3fs_client import Hf3fsClient
+from sglang.srt.mem_cache.storage.hf3fs.hf3fs_host_allocator import (
+    Hf3fsHostTensorAllocator,
+)
 from sglang.srt.observability.metrics_collector import StorageMetrics
 
 logger = logging.getLogger(__name__)
@@ -201,6 +205,8 @@ class HiCacheHF3FS(HiCacheStorage):
         is_page_first_layout: bool = False,
         use_mock_client: bool = False,
         enable_storage_metrics: bool = False,
+        zero_copy_host_pool: bool = False,
+        iov_block_bytes: Optional[int] = None,
     ):
         self.rank = rank
         self.file_path = file_path
@@ -216,6 +222,11 @@ class HiCacheHF3FS(HiCacheStorage):
         self.is_page_first_layout = is_page_first_layout
         self.enable_storage_metrics = enable_storage_metrics
         self.use_mock_client = use_mock_client
+        self.zero_copy_host_pool = zero_copy_host_pool
+        self.iov_block_bytes = iov_block_bytes
+        self.direct_iovs = None
+        self._closed = False
+        self._close_lock = threading.Lock()
         self.numel = self.bytes_per_page // self.dtype.itemsize
         self.num_pages = self.file_size // self.bytes_per_page
         self.skip_backup = False
@@ -285,6 +296,7 @@ class HiCacheHF3FS(HiCacheStorage):
         )
 
         use_mock_client = False
+        zero_copy_host_pool = False
         if storage_config is not None:
             rank, is_mla_model, is_page_first_layout = (
                 storage_config.tp_rank,
@@ -295,6 +307,9 @@ class HiCacheHF3FS(HiCacheStorage):
             if storage_config.extra_config is not None:
                 use_mock_client = storage_config.extra_config.get(
                     "use_mock_hf3fs_client", False
+                )
+                zero_copy_host_pool = bool(
+                    storage_config.extra_config.get(HF3FS_ZERO_COPY_CONFIG_KEY, False)
                 )
         else:
             rank, is_mla_model, is_page_first_layout = (
@@ -322,6 +337,7 @@ class HiCacheHF3FS(HiCacheStorage):
                 metadata_client=Hf3fsLocalMetadataClient(),
                 is_page_first_layout=is_page_first_layout,
                 use_mock_client=use_mock_client,
+                zero_copy_host_pool=zero_copy_host_pool,
             )
 
         try:
@@ -374,6 +390,10 @@ class HiCacheHF3FS(HiCacheStorage):
             is_page_first_layout=is_page_first_layout,
             use_mock_client=use_mock_client,
             enable_storage_metrics=storage_config.enable_storage_metrics,
+            zero_copy_host_pool=zero_copy_host_pool,
+            iov_block_bytes=(
+                int(config["iov_block_size"]) if "iov_block_size" in config else None
+            ),
         )
 
     def _batch_get(
@@ -393,21 +413,19 @@ class HiCacheHF3FS(HiCacheStorage):
                 batch_indices.append(i)
                 file_offsets.append(page_index * self.bytes_per_page)
 
-        for target_location in values:
+        # Only hits are read; offsets and destinations must stay paired.
+        file_results = [values[i] for i in batch_indices]
+        for target_location in file_results:
             assert target_location.is_contiguous()
-        file_results = values
 
         start_time = time.perf_counter()
 
-        futures = [
-            self.executor.submit(
-                self.clients[self.ac.next()].batch_read,
-                file_offsets[i : i + self.entries],
-                file_results[i : i + self.entries],
-            )
-            for i in range(0, len(batch_indices), self.entries)
-        ]
-        read_results = [result for future in futures for result in future.result()]
+        read_results = self._run_io(
+            clients=self.clients,
+            read=True,
+            offsets=file_offsets,
+            tensors=file_results,
+        )
 
         end_time = time.perf_counter()
         ionum = len(batch_indices)
@@ -467,18 +485,14 @@ class HiCacheHF3FS(HiCacheStorage):
 
         start_time = time.perf_counter()
 
-        futures = [
-            self.executor.submit(
-                self.clients[self.ac.next()].batch_write,
-                file_offsets[i : i + self.entries],
-                file_values[i : i + self.entries],
-            )
-            for i in range(0, len(batch_indices), self.entries)
-        ]
         write_results = [
             result == self.bytes_per_page
-            for future in futures
-            for result in future.result()
+            for result in self._run_io(
+                clients=self.clients,
+                read=False,
+                offsets=file_offsets,
+                tensors=file_values,
+            )
         ]
 
         end_time = time.perf_counter()
@@ -507,6 +521,41 @@ class HiCacheHF3FS(HiCacheStorage):
                 self.rank, written_keys_to_confirm, pages_to_release
             )
 
+        return results
+
+    def _run_io(
+        self,
+        clients: List[Hf3fsClient],
+        read: bool,
+        offsets: List[int],
+        tensors: List[torch.Tensor],
+    ) -> List[int]:
+        """Split I/O across clients; per-I/O byte counts, 0 for a failed chunk.
+
+        Waits for every chunk before returning, even when one raises, so no
+        worker still touches host memory the caller is about to release.
+        """
+        chunks = []
+        for i in range(0, len(offsets), self.entries):
+            client = clients[self.ac.next()]
+            fn = client.batch_read if read else client.batch_write
+            chunk_offsets = offsets[i : i + self.entries]
+            future = self.executor.submit(
+                fn, chunk_offsets, tensors[i : i + self.entries]
+            )
+            chunks.append((future, len(chunk_offsets)))
+        concurrent.futures.wait([future for future, _ in chunks])
+
+        results = []
+        for future, num_ios in chunks:
+            try:
+                results.extend(future.result())
+            except Exception as e:
+                logger.error(
+                    f"[Rank {self.rank}] HiCacheHF3FS batch "
+                    f"{'read' if read else 'write'} failed: {e}"
+                )
+                results.extend([0] * num_ios)
         return results
 
     def delete(self, key: str) -> None:
@@ -542,15 +591,28 @@ class HiCacheHF3FS(HiCacheStorage):
             logger.error(f"Failed to clear HiCacheHF3FS: {e}")
 
     def close(self) -> None:
+        # Teardown order: workers finish (their batches drain all I/O), then the
+        # rings go, then the shared host-memory registrations. The host pool
+        # itself is owned by HiCache and stays alive.
+        with self._close_lock:
+            if self._closed:
+                return
+            self._closed = True
         try:
-            for c in self.clients:
-                c.close()
-            for ctx in getattr(self, "_pool_storage_ctx", {}).values():
-                for c in ctx.clients:
-                    c.close()
             self.executor.shutdown(wait=True)
         except Exception as e:
-            logger.error(f"close HiCacheHF3FS: {e}")
+            logger.error(f"close HiCacheHF3FS executor: {e}")
+        clients = list(self.clients)
+        for ctx in self._pool_storage_ctx.values():
+            clients.extend(ctx.clients)
+        for c in clients:
+            try:
+                c.close()
+            except Exception as e:
+                logger.error(f"close HiCacheHF3FS client: {e}")
+        if self.direct_iovs is not None:
+            self.direct_iovs.close()
+            self.direct_iovs = None
         logger.info("close HiCacheHF3FS")
 
     def get_stats(self):
@@ -572,8 +634,68 @@ class HiCacheHF3FS(HiCacheStorage):
             "page_first_direct",
         ]
         self.mha_zero_copy = self.is_zero_copy and not self.is_mla_model
+        if self.zero_copy_host_pool:
+            self._register_direct_iovs()
 
-        logger.info(f"{self.is_zero_copy=}, layout={self.mem_pool_host.layout}")
+        logger.info(
+            f"{self.is_zero_copy=}, layout={self.mem_pool_host.layout}, "
+            f"direct_iovs={self.direct_iovs is not None}"
+        )
+
+    def _register_direct_iovs(self) -> None:
+        """Let the USRBIO rings read/write the host pool in place.
+
+        Any batch tensor outside the registered memory keeps the staging copy.
+        """
+        if not self.is_zero_copy:
+            logger.warning(
+                f"{HF3FS_ZERO_COPY_CONFIG_KEY} needs the page_first or "
+                f"page_first_direct host layout, got {self.mem_pool_host.layout}; "
+                "using staging copies."
+            )
+            return
+        if self.use_mock_client:
+            return
+        allocator = (
+            self.mem_pool_host.allocator
+            if isinstance(self.mem_pool_host, HostKVCache)
+            else None
+        )
+        if (
+            not isinstance(allocator, Hf3fsHostTensorAllocator)
+            or not allocator.allocations
+        ):
+            # E.g. storage attached at runtime to a pool created without the opt-in.
+            logger.warning(
+                "HiCache host pool is not backed by /dev/shm; HF3FS I/O uses "
+                f"staging copies. Set {HF3FS_ZERO_COPY_CONFIG_KEY} in the storage "
+                "extra config at server start to enable zero-copy."
+            )
+            return
+
+        from sglang.srt.mem_cache.storage.hf3fs.hf3fs_usrbio_client import (
+            DEFAULT_IOV_BLOCK_BYTES,
+            Hf3fsDirectIovs,
+        )
+
+        try:
+            direct_iovs = Hf3fsDirectIovs(
+                mount_point=self.clients[0].hf3fs_mount_point,
+                allocations=allocator.allocations,
+                io_bytes=self.bytes_per_page,
+                target_block_bytes=self.iov_block_bytes or DEFAULT_IOV_BLOCK_BYTES,
+            )
+        except Exception as e:
+            logger.warning(
+                f"Registering the HiCache host pool with 3FS failed ({e}); "
+                "HF3FS I/O uses staging copies."
+            )
+            return
+        if self.direct_iovs is not None:
+            self.direct_iovs.close()
+        self.direct_iovs = direct_iovs
+        for c in self.clients:
+            c.set_direct_iovs(direct_iovs)
 
     def register_mem_host_pool_v2(self, host_pool: HostKVCache, host_pool_name):
         if host_pool_name == PoolName.KV:
@@ -746,15 +868,9 @@ class HiCacheHF3FS(HiCacheStorage):
             return [False] * page_num
 
         start_time = time.perf_counter()
-        futures = [
-            self.executor.submit(
-                ctx.clients[self.ac.next()].batch_read,
-                file_offsets[j : j + self.entries],
-                values[j : j + self.entries],
-            )
-            for j in range(0, len(batch_indices), self.entries)
-        ]
-        read_results = [r for f in futures for r in f.result()]
+        read_results = self._run_io(
+            clients=ctx.clients, read=True, offsets=file_offsets, tensors=values
+        )
         end_time = time.perf_counter()
         ionum = len(batch_indices)
 
@@ -816,15 +932,15 @@ class HiCacheHF3FS(HiCacheStorage):
             file_values.append(data)
 
         start_time = time.perf_counter()
-        futures = [
-            self.executor.submit(
-                ctx.clients[self.ac.next()].batch_write,
-                file_offsets[j : j + self.entries],
-                file_values[j : j + self.entries],
+        write_results = [
+            r == ctx.bytes_per_page
+            for r in self._run_io(
+                clients=ctx.clients,
+                read=False,
+                offsets=file_offsets,
+                tensors=file_values,
             )
-            for j in range(0, len(batch_indices), self.entries)
         ]
-        write_results = [r == ctx.bytes_per_page for f in futures for r in f.result()]
         end_time = time.perf_counter()
         ionum = len(batch_indices)
 

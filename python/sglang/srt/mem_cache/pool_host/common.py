@@ -19,6 +19,11 @@ _is_hip = is_hip()
 
 _CUDA_HOST_REGISTERED_RANGES_ATTR = "_sglang_cuda_host_registered_ranges"
 
+# The pool must be allocated in /dev/shm at startup for HF3FS zero-copy I/O,
+# so the opt-in lives in the storage extra config read before allocation.
+HF3FS_ZERO_COPY_CONFIG_KEY = "hf3fs_zero_copy_host_pool"
+HF3FS_ZERO_COPY_ALLOCATOR = "hf3fs_shm"
+
 
 class HostTensorAllocator:
     def __init__(self):
@@ -103,6 +108,12 @@ def get_allocator_from_storage(allocator_type):
             return HostTensorAllocator()
     elif allocator_type == "shm":
         return ShmHostTensorAllocator()
+    elif allocator_type == HF3FS_ZERO_COPY_ALLOCATOR:
+        from sglang.srt.mem_cache.storage.hf3fs.hf3fs_host_allocator import (
+            Hf3fsHostTensorAllocator,
+        )
+
+        return Hf3fsHostTensorAllocator()
     elif allocator_type == "tensorcast":
         try:
             from sglang.srt.mem_cache.storage.tensorcast_store.host_allocator import (
@@ -125,13 +136,15 @@ def get_allocator_type() -> str:
     backend = get_memory().hicache_storage_backend
     if backend == "shm":
         return "shm"
-    if backend == "dynamic":
+    if backend in ("dynamic", "hf3fs"):
         extra_config_str = get_memory().hicache_storage_backend_extra_config
         if extra_config_str:
             try:
                 config = json.loads(extra_config_str)
-                if config.get("allocator") == "shm":
+                if backend == "dynamic" and config.get("allocator") == "shm":
                     return "shm"
+                if backend == "hf3fs" and config.get(HF3FS_ZERO_COPY_CONFIG_KEY):
+                    return HF3FS_ZERO_COPY_ALLOCATOR
             except Exception:
                 pass
     return backend or "default"
