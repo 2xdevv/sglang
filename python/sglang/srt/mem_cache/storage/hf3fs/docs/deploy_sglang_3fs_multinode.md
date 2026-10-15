@@ -17,6 +17,10 @@ vim /sgl-workspace/sglang/benchmark/hf3fs/hf3fs_config.json
 }
 ```
 
+Optional `"dispatch_mode"` controls how each batch is split across the `numjobs` clients:
+- `"fixed"` (default): chunks of `entries` pages, so a batch of N pages uses `ceil(N / entries)` clients.
+- `"balanced"`: pages are spread evenly over all `numjobs` clients (each chunk still `<= entries`), which raises read/write parallelism for small batches.
+
 ## node1
 ```bash
 export SGLANG_HICACHE_HF3FS_CONFIG_PATH=/sgl-workspace/sglang/benchmark/hf3fs/hf3fs_config.json

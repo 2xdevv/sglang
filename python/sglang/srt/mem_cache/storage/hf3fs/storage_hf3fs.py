@@ -185,6 +185,10 @@ class HiCacheHF3FS(HiCacheStorage):
     """HiCache backend that stores KV cache pages in HF3FS files."""
 
     default_env_var: str = "SGLANG_HICACHE_HF3FS_CONFIG_PATH"
+    # How a batch is split across the `numjobs` clients:
+    #   fixed:    chunks of `entries` pages, so small batches use few clients.
+    #   balanced: spread pages evenly over all clients (each chunk <= `entries`).
+    DISPATCH_MODES = ("fixed", "balanced")
 
     def __init__(
         self,
@@ -201,7 +205,13 @@ class HiCacheHF3FS(HiCacheStorage):
         is_page_first_layout: bool = False,
         use_mock_client: bool = False,
         enable_storage_metrics: bool = False,
+        dispatch_mode: str = "fixed",
     ):
+        if dispatch_mode not in self.DISPATCH_MODES:
+            raise ValueError(
+                f"Invalid HF3FS dispatch_mode {dispatch_mode!r}, "
+                f"expected one of {self.DISPATCH_MODES}"
+            )
         self.rank = rank
         self.file_path = file_path
         self.file_size = file_size
@@ -209,6 +219,7 @@ class HiCacheHF3FS(HiCacheStorage):
         self.bytes_per_page = bytes_per_page
         self.gb_per_page = bytes_per_page / (1 << 30)
         self.entries = entries
+        self.dispatch_mode = dispatch_mode
         self.client_timeout = client_timeout
         self.dtype = dtype
         self.metadata_client = metadata_client
@@ -230,7 +241,8 @@ class HiCacheHF3FS(HiCacheStorage):
             f"file_path={self.file_path}, "
             f"file_size={self.file_size / (2**30):.2f} GB, "
             f"num_pages={self.num_pages}, "
-            f"is_mla_model={self.is_mla_model}"
+            f"is_mla_model={self.is_mla_model}, "
+            f"dispatch_mode={self.dispatch_mode}"
         )
 
         self.ac = AtomicCounter(self.numjobs)
@@ -374,7 +386,13 @@ class HiCacheHF3FS(HiCacheStorage):
             is_page_first_layout=is_page_first_layout,
             use_mock_client=use_mock_client,
             enable_storage_metrics=storage_config.enable_storage_metrics,
+            dispatch_mode=config.get("dispatch_mode", "fixed"),
         )
+
+    def _dispatch_chunk_size(self, num_pages: int) -> int:
+        if self.dispatch_mode == "balanced":
+            return min(self.entries, max(1, -(-num_pages // self.numjobs)))
+        return self.entries
 
     def _batch_get(
         self,
@@ -398,14 +416,15 @@ class HiCacheHF3FS(HiCacheStorage):
         file_results = values
 
         start_time = time.perf_counter()
+        step = self._dispatch_chunk_size(len(batch_indices))
 
         futures = [
             self.executor.submit(
                 self.clients[self.ac.next()].batch_read,
-                file_offsets[i : i + self.entries],
-                file_results[i : i + self.entries],
+                file_offsets[i : i + step],
+                file_results[i : i + step],
             )
-            for i in range(0, len(batch_indices), self.entries)
+            for i in range(0, len(batch_indices), step)
         ]
         read_results = [result for future in futures for result in future.result()]
 
@@ -466,14 +485,15 @@ class HiCacheHF3FS(HiCacheStorage):
             file_values.append(value)
 
         start_time = time.perf_counter()
+        step = self._dispatch_chunk_size(len(batch_indices))
 
         futures = [
             self.executor.submit(
                 self.clients[self.ac.next()].batch_write,
-                file_offsets[i : i + self.entries],
-                file_values[i : i + self.entries],
+                file_offsets[i : i + step],
+                file_values[i : i + step],
             )
-            for i in range(0, len(batch_indices), self.entries)
+            for i in range(0, len(batch_indices), step)
         ]
         write_results = [
             result == self.bytes_per_page
@@ -746,13 +766,14 @@ class HiCacheHF3FS(HiCacheStorage):
             return [False] * page_num
 
         start_time = time.perf_counter()
+        step = self._dispatch_chunk_size(len(batch_indices))
         futures = [
             self.executor.submit(
                 ctx.clients[self.ac.next()].batch_read,
-                file_offsets[j : j + self.entries],
-                values[j : j + self.entries],
+                file_offsets[j : j + step],
+                values[j : j + step],
             )
-            for j in range(0, len(batch_indices), self.entries)
+            for j in range(0, len(batch_indices), step)
         ]
         read_results = [r for f in futures for r in f.result()]
         end_time = time.perf_counter()
@@ -816,13 +837,14 @@ class HiCacheHF3FS(HiCacheStorage):
             file_values.append(data)
 
         start_time = time.perf_counter()
+        step = self._dispatch_chunk_size(len(batch_indices))
         futures = [
             self.executor.submit(
                 ctx.clients[self.ac.next()].batch_write,
-                file_offsets[j : j + self.entries],
-                file_values[j : j + self.entries],
+                file_offsets[j : j + step],
+                file_values[j : j + step],
             )
-            for j in range(0, len(batch_indices), self.entries)
+            for j in range(0, len(batch_indices), step)
         ]
         write_results = [r == ctx.bytes_per_page for f in futures for r in f.result()]
         end_time = time.perf_counter()
