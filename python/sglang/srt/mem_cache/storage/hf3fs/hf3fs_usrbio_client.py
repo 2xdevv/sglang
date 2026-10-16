@@ -3,9 +3,10 @@ import logging
 import multiprocessing
 import os
 import threading
+import time
 from functools import wraps
 from pathlib import Path
-from typing import List
+from typing import Callable, List, Optional
 
 import torch
 
@@ -121,36 +122,43 @@ class Hf3fsUsrBioClient(Hf3fsClient):
     def batch_read(self, offsets: List[int], tensors: List[torch.Tensor]) -> List[int]:
         self.check(offsets, tensors)
         results = [0] * len(offsets)
-        # prepare
+        # Each page has its own shm region until all prepared reads complete.
+        # Reap ready pages without waiting for the whole batch so their copy
+        # into the destination tensors overlaps the remaining reads.
+        num_prepared = 0
+        shm_offsets = []
         current = 0
-        for offset, tensor in zip(offsets, tensors):
-            size = tensor.numel() * tensor.itemsize
-            try:
+        try:
+            for offset, tensor in zip(offsets, tensors):
+                size = tensor.numel() * tensor.itemsize
+                shm_offsets.append(current)
                 self.ior_r.prepare(
-                    self.iov_r[current : current + size], True, self.file, offset
+                    self.iov_r[current : current + size],
+                    True,
+                    self.file,
+                    offset,
+                    userdata=num_prepared,
                 )
+                num_prepared += 1
                 current += size
-            except Exception as e:
-                logger.error(f"Error preparing batch read: {e}")
-                return results
-        # submit
-        ionum = len(offsets)
-        try:
-            resv = self.ior_r.submit().wait(
-                min_results=ionum,
-                timeout=datetime.timedelta(seconds=self.client_timeout),
-            )
         except Exception as e:
-            logger.error(f"Error submitting batch read: {e}")
-            return results
-        # results
-        try:
-            hf3fs_utils.read_shm(self.shm_r_tensor, tensors)
-            results = [res.result for res in resv]
-        except Exception as e:
-            logger.error(f"[Hf3fsUsrBioClient] read_shm failed: {e}", exc_info=True)
-            return results
+            logger.error(f"Error preparing batch read: {e}")
 
+        if num_prepared:
+            try:
+                self.ior_r.submit()
+            except Exception as e:
+                logger.error(f"Error submitting batch read: {e}")
+
+        def copy_page(index: int, result: int) -> None:
+            tensor = tensors[index]
+            size = tensor.numel() * tensor.itemsize
+            # Failed and short reads must not copy stale bytes from shm.
+            if result == size:
+                start = shm_offsets[index]
+                hf3fs_utils.read_shm(self.shm_r_tensor[start : start + size], [tensor])
+
+        self._wait_all(self.ior_r, num_prepared, results, "read", copy_page)
         return results
 
     @wsynchronized()
@@ -186,6 +194,49 @@ class Hf3fsUsrBioClient(Hf3fsClient):
         results = [res.result for res in resv]
 
         return results
+
+    def _wait_all(
+        self,
+        ior,
+        num_ios: int,
+        results: List[int],
+        op: str,
+        on_complete: Optional[Callable[[int, int], None]] = None,
+    ) -> None:
+        # Returning with I/O in flight would let the next call overwrite its shm
+        # region and ring slot, so wait out every prepared I/O, even past the timeout.
+        # Completions arrive in completion order; userdata is the page index.
+        timeout = datetime.timedelta(seconds=self.client_timeout)
+        done = 0
+        while done < num_ios:
+            try:
+                resv = ior.wait(
+                    max_results=num_ios - done,
+                    min_results=1 if on_complete is not None else num_ios - done,
+                    timeout=timeout,
+                )
+            except Exception as e:
+                logger.error(f"Error waiting for batch {op}: {e}")
+                resv = []
+                # Avoid a hot loop if wait() fails immediately.
+                time.sleep(0.1)
+            for res in resv:
+                results[res.userdata] = res.result
+                if on_complete is not None:
+                    try:
+                        on_complete(res.userdata, res.result)
+                    except Exception as e:
+                        results[res.userdata] = 0
+                        logger.error(
+                            f"[Hf3fsUsrBioClient] batch {op} completion failed: {e}",
+                            exc_info=True,
+                        )
+            done += len(resv)
+            if done < num_ios and (not resv or on_complete is None):
+                logger.warning(
+                    f"[Hf3fsUsrBioClient] batch {op}: {num_ios - done} I/O(s) "
+                    f"still outstanding after {self.client_timeout}s, waiting"
+                )
 
     def check(self, offsets: List[int], tensors: List[torch.Tensor]) -> None:
         sizes = [t.numel() * t.itemsize for t in tensors]
